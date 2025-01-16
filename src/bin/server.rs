@@ -2,6 +2,7 @@ use std::net::TcpListener;
 use std::io::{Read, Write};
 use serde::{Serialize, Deserialize};
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -15,6 +16,7 @@ enum GameState {
     WaitingForPlayers,
     Playing,
     GameOver(bool),
+    CPUMode,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,7 +49,7 @@ impl Game {
     fn new() -> Self {
         let mut rng = rand::thread_rng();
         let mut blocked_squares = Vec::new();
-        for _ in 0..SQUARES {
+        for _ in 0..SQUARES * 2 {
             blocked_squares.push((rng.gen_range(1..SQUARES-1), rng.gen_range(1..SQUARES-1)));
         }
 
@@ -134,6 +136,43 @@ impl Game {
     }
 }
 
+fn simulate_cpu_runner(game: &mut Game) {
+    let mut rng = rand::thread_rng();
+    let mut possible_moves = Vec::new();
+
+    for dx in -game.runner.power..=game.runner.power {
+        for dy in -game.runner.power..=game.runner.power {
+            let new_pos = (game.runner.position.0 + dx, game.runner.position.1 + dy);
+
+            if new_pos.0 >= 0 && new_pos.0 < SQUARES &&
+                new_pos.1 >= 0 && new_pos.1 < SQUARES &&
+                !game.blocker.blocked_squares.contains(&new_pos) {
+
+                if new_pos.0 == 0 || new_pos.0 == SQUARES - 1 ||
+                    new_pos.1 == 0 || new_pos.1 == SQUARES - 1 {
+                    for _ in 0..3 {
+                        possible_moves.push(new_pos);
+                    }
+                } else {
+                    possible_moves.push(new_pos);
+                }
+            }
+        }
+    }
+
+    if let Some(&new_pos) = possible_moves.choose(&mut rng) {
+        game.runner.position = new_pos;
+        game.runner.moved = true;
+        game.current_player = String::from("blocker");
+
+        if new_pos.0 == 0 || new_pos.0 == SQUARES - 1 ||
+            new_pos.1 == 0 || new_pos.1 == SQUARES - 1 {
+            game.won = true;
+            game.game_state = GameState::GameOver(true);
+        }
+    }
+}
+
 fn handle_client(mut stream: std::net::TcpStream, game: Arc<Mutex<Game>>, player_type: String) {
     loop {
         let mut buffer = [0; 512];
@@ -144,7 +183,37 @@ fn handle_client(mut stream: std::net::TcpStream, game: Arc<Mutex<Game>>, player
                 }
                 let action = String::from_utf8_lossy(&buffer[..n]);
                 let mut game = game.lock().unwrap();
+
+                if action.trim() == "activate_cpu" && matches!(game.game_state, GameState::WaitingForPlayers) {
+                    game.game_state = GameState::CPUMode;
+                    if game.current_player == "runner" {
+                        simulate_cpu_runner(&mut game);
+                    }
+                    let response = serde_json::to_string(&(game.clone(), player_type.clone(), true)).unwrap();
+                    if let Err(_) = stream.write_all(response.as_bytes()) {
+                        break;
+                    }
+                    continue;
+                }
+                if action.trim() == "poll" && matches!(game.game_state, GameState::CPUMode) {
+                    if game.current_player == "runner" {
+                        simulate_cpu_runner(&mut game);
+                    }
+                    let response = serde_json::to_string(&(game.clone(), player_type.clone(), true)).unwrap();
+                    if let Err(_) = stream.write_all(response.as_bytes()) {
+                        break;
+                    }
+                    continue;
+                }
+
                 let success = game.update(&action, &player_type);
+
+                if success && matches!(game.game_state, GameState::CPUMode) {
+                    if game.current_player == "runner" {
+                        simulate_cpu_runner(&mut game);
+                    }
+                }
+
                 let response = serde_json::to_string(&(game.clone(), player_type.clone(), success)).unwrap();
                 if let Err(_) = stream.write_all(response.as_bytes()) {
                     break;
@@ -154,7 +223,6 @@ fn handle_client(mut stream: std::net::TcpStream, game: Arc<Mutex<Game>>, player
         }
     }
 }
-
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:25567").unwrap();
     let game = Arc::new(Mutex::new(Game::new()));
@@ -178,15 +246,15 @@ fn main() {
                 player_count += 1;
 
                 let player_type = if player_count == 1 {
-                    println!("Runner connected!");
-                    String::from("runner")
-                } else {
                     println!("Blocker connected!");
+                    String::from("blocker")
+                } else {
+                    println!("Runner connected!");
                     {
                         let mut game = game.lock().unwrap();
                         game.game_state = GameState::Playing;
                     }
-                    String::from("blocker")
+                    String::from("runner")
                 };
 
                 connections.push(stream.try_clone().unwrap());

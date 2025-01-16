@@ -13,6 +13,7 @@ enum GameState {
     WaitingForPlayers,
     Playing,
     GameOver(bool),
+    CPUMode,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -154,27 +155,27 @@ async fn main() {
 
     loop {
         clear_background(LIGHTGRAY);
-
-        match client.send_action("poll") {
-            Ok((new_game, new_player_type, _)) => {
-                game = new_game;
-                player_type = new_player_type;
-                last_update = get_time();
-            }
-            Err(e) => {
-                draw_text(
-                    &format!("Connection error: {}. Retrying...", e),
-                    10.,
-                    30.,
-                    20.,
-                    RED,
-                );
+        if matches!(game.game_state, GameState::WaitingForPlayers) && is_key_pressed(KeyCode::Space) {
+            match client.send_action("activate_cpu") {
+                Ok((new_game, new_player_type, _)) => {
+                    game = new_game;
+                    player_type = new_player_type;
+                }
+                Err(e) => {
+                    draw_text(
+                        &format!("Failed to activate CPU mode: {}. Retrying...", e),
+                        10.,
+                        30.,
+                        20.,
+                        RED,
+                    );
+                }
             }
         }
 
         match game.game_state {
             GameState::WaitingForPlayers => {
-                let text = "Waiting for other player...";
+                let text = "Press SPACE to play against CPU or wait for other player...";
                 let font_size = 30.;
                 let text_size = measure_text(text, None, font_size as _, 1.0);
                 draw_text(
@@ -185,7 +186,7 @@ async fn main() {
                     DARKGRAY,
                 );
             }
-            GameState::Playing => {
+            GameState::CPUMode | GameState::Playing => {
                 let game_size = screen_width().min(screen_height());
                 let offset_x = (screen_width() - game_size) / 2. + 10.;
                 let offset_y = (screen_height() - game_size) / 2. + 10.;
