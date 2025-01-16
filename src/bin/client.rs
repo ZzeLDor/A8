@@ -163,7 +163,7 @@ async fn main() {
                 }
                 Err(e) => {
                     draw_text(
-                        &format!("Failed to activate CPU mode: {}. Retrying...", e),
+                        &format!("CPU Failed {}", e),
                         10.,
                         30.,
                         20.,
@@ -219,7 +219,7 @@ async fn main() {
                             offset_y + y as f32 * sq_size,
                             sq_size,
                             sq_size,
-                            BLUE,
+                            SKYBLUE,
                         );
                     }
                 }
