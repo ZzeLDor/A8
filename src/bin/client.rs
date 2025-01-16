@@ -3,32 +3,32 @@ use std::net::TcpStream;
 use std::io::{Read, Write};
 use serde::{Serialize, Deserialize};
 
-const SQUARES: i16 = 16;
+const SQUARES: i16 = 21;
 const POWER: i16 = 1;
 
 type Point = (i16, i16);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum GameState {
-    Menu,
+    WaitingForPlayers,
     Playing,
     GameOver(bool),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Runner {
     position: (i16, i16),
     power: i16,
     moved: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Blocker {
     blocked_squares: Vec<(i16, i16)>,
     moved: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Game {
     runner: Runner,
     blocker: Blocker,
@@ -38,24 +38,95 @@ struct Game {
     game_state: GameState,
     squares: i16,
     power: i16,
+    current_player: String,
 }
 
-fn send_action(action: &str, x: i16, y: i16) -> Game {
+fn send_action(action: &str) -> (Game, String, bool) {
     let mut stream = TcpStream::connect("127.0.0.1:25567").unwrap();
-    let action = format!("{} {} {}", action, x, y);
     stream.write_all(action.as_bytes()).unwrap();
 
-    let mut buffer = [0; 512];
+    let mut buffer = [0; 4096];
     let n = stream.read(&mut buffer).unwrap();
-
     let response = String::from_utf8_lossy(&buffer[..n]);
-    let tresponse = response.trim_end_matches(char::from(0));
-    serde_json::from_str(&tresponse).unwrap()
+    serde_json::from_str(&response).unwrap()
 }
 
-fn is_mouse_over_button(mouse_pos: Vec2, button_pos: Vec2, button_size: Vec2) -> bool {
-    mouse_pos.x >= button_pos.x && mouse_pos.x <= button_pos.x + button_size.x &&
-        mouse_pos.y >= button_pos.y && mouse_pos.y <= button_pos.y + button_size.y
+struct GameClient {
+    stream: Option<TcpStream>,
+    max_retries: u32,
+}
+
+impl GameClient {
+    fn new(max_retries: u32) -> Self {
+        Self {
+            stream: None,
+            max_retries,
+        }
+    }
+
+    fn connect(&mut self) -> Result<(), std::io::Error> {
+        self.stream = Some(TcpStream::connect("127.0.0.1:25567")?);
+        Ok(())
+    }
+
+    fn ensure_connected(&mut self) -> Result<(), std::io::Error> {
+        if self.stream.is_none() {
+            self.connect()?;
+        }
+        Ok(())
+    }
+
+    fn send_action(&mut self, action: &str) -> Result<(Game, String, bool), std::io::Error> {
+        let mut retries = 0;
+        loop {
+            if retries >= self.max_retries {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Max retries reached"
+                ));
+            }
+
+            match self.ensure_connected() {
+                Ok(()) => {
+                    let stream = self.stream.as_mut().unwrap();
+                    match stream.write_all(action.as_bytes()) {
+                        Ok(()) => {
+                            let mut buffer = [0; 4096];
+                            match stream.read(&mut buffer) {
+                                Ok(n) if n > 0 => {
+                                    let response = String::from_utf8_lossy(&buffer[..n]);
+                                    return Ok(serde_json::from_str(&response).unwrap());
+                                }
+                                Ok(_) | Err(_) => {
+                                    self.stream = None;
+                                    retries += 1;
+                                    std::thread::sleep(std::time::Duration::from_millis(500));
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.stream = None;
+                            retries += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+fn is_within_power(start: Point, end: Point, power: i16) -> bool {
+    let dx = (start.0 - end.0).abs();
+    let dy = (start.1 - end.1).abs();
+    dx <= power && dy <= power && !(dx == 0 && dy == 0)
 }
 
 fn get_grid_pos(mouse_pos: Vec2, offset_x: f32, offset_y: f32, sq_size: f32, sent_sq: i16) -> Option<Point> {
@@ -69,66 +140,56 @@ fn get_grid_pos(mouse_pos: Vec2, offset_x: f32, offset_y: f32, sq_size: f32, sen
     }
 }
 
-fn is_within_power(start: Point, end: Point, power: i16) -> bool {
-    let dx = (start.0 - end.0).abs();
-    let dy = (start.1 - end.1).abs();
-    dx <= power && dy <= power && !(dx == 0 && dy == 0)
-}
-
-#[macroquad::main("Runner Problem")]
+#[macroquad::main("Angel Problem - Multiplayer")]
 async fn main() {
-    let mut game = send_action("init", 0, 0);
+    let mut client = GameClient::new(3);
+    let (mut game, mut player_type, _) = match client.send_action("init") {
+        Ok(response) => response,
+        Err(e) => {
+            println!("Failed to connect to server: {}", e);
+            return;
+        }
+    };
+    let mut last_update = get_time();
 
     loop {
+        clear_background(LIGHTGRAY);
+
+        match client.send_action("poll") {
+            Ok((new_game, new_player_type, _)) => {
+                game = new_game;
+                player_type = new_player_type;
+                last_update = get_time();
+            }
+            Err(e) => {
+                draw_text(
+                    &format!("Connection error: {}. Retrying...", e),
+                    10.,
+                    30.,
+                    20.,
+                    RED,
+                );
+            }
+        }
+
         match game.game_state {
-            GameState::Menu => {
-                clear_background(LIGHTGRAY);
-                let text = "Start Game";
+            GameState::WaitingForPlayers => {
+                let text = "Waiting for other player...";
                 let font_size = 30.;
                 let text_size = measure_text(text, None, font_size as _, 1.0);
-                let button_pos = Vec2::new(screen_width() / 2. - text_size.width / 2., screen_height() / 2. - text_size.height / 2.);
-                let button_size = Vec2::new(text_size.width, text_size.height);
-
                 draw_text(
                     text,
-                    button_pos.x,
-                    button_pos.y + text_size.height,
+                    screen_width() / 2. - text_size.width / 2.,
+                    screen_height() / 2.,
                     font_size,
                     DARKGRAY,
                 );
-
-                if is_mouse_button_pressed(MouseButton::Left) {
-                    let mouse_pos = mouse_position();
-                    if is_mouse_over_button(Vec2::new(mouse_pos.0, mouse_pos.1), button_pos, button_size) {
-                        game = send_action("start_game", 0, 0);
-                    }
-                }
             }
             GameState::Playing => {
-                clear_background(LIGHTGRAY);
-
                 let game_size = screen_width().min(screen_height());
                 let offset_x = (screen_width() - game_size) / 2. + 10.;
                 let offset_y = (screen_height() - game_size) / 2. + 10.;
                 let sq_size = (screen_height() - offset_y * 2.) / game.squares as f32;
-
-                let mouse_pos = mouse_position();
-                let hover_pos = get_grid_pos(Vec2::new(mouse_pos.0, mouse_pos.1), offset_x, offset_y, sq_size, game.squares);
-
-                if is_mouse_button_pressed(MouseButton::Left) {
-                    if let Some(grid_pos) = hover_pos {
-                        if !game.runner.moved {
-                            if is_within_power(game.runner.position, grid_pos, game.power)
-                                && !game.blocker.blocked_squares.contains(&grid_pos) {
-                                game = send_action("move_runner", grid_pos.0, grid_pos.1);
-                            }
-                        } else if !game.blocker.moved {
-                            if grid_pos != game.runner.position && !game.blocker.blocked_squares.contains(&grid_pos) {
-                                game = send_action("move_blocker", grid_pos.0, grid_pos.1);
-                            }
-                        }
-                    }
-                }
 
                 draw_rectangle(offset_x, offset_y, game_size - 20., game_size - 20., WHITE);
                 for i in 1..game.squares {
@@ -151,34 +212,15 @@ async fn main() {
                 }
 
                 for i in 0..game.squares {
-                    draw_rectangle(
-                        offset_x + i as f32 * sq_size,
-                        offset_y,
-                        sq_size,
-                        sq_size,
-                        BLUE,
-                    );
-                    draw_rectangle(
-                        offset_x + i as f32 * sq_size,
-                        offset_y + (game.squares - 1) as f32 * sq_size,
-                        sq_size,
-                        sq_size,
-                        BLUE,
-                    );
-                    draw_rectangle(
-                        offset_x,
-                        offset_y + i as f32 * sq_size,
-                        sq_size,
-                        sq_size,
-                        BLUE,
-                    );
-                    draw_rectangle(
-                        offset_x + (game.squares - 1) as f32 * sq_size,
-                        offset_y + i as f32 * sq_size,
-                        sq_size,
-                        sq_size,
-                        BLUE,
-                    );
+                    for (x, y) in [(i, 0), (i, game.squares-1), (0, i), (game.squares-1, i)] {
+                        draw_rectangle(
+                            offset_x + x as f32 * sq_size,
+                            offset_y + y as f32 * sq_size,
+                            sq_size,
+                            sq_size,
+                            BLUE,
+                        );
+                    }
                 }
 
                 for pos in &game.blocker.blocked_squares {
@@ -199,75 +241,117 @@ async fn main() {
                     GOLD,
                 );
 
+                let mouse_pos = mouse_position();
+                let hover_pos = get_grid_pos(Vec2::new(mouse_pos.0, mouse_pos.1), offset_x, offset_y, sq_size, game.squares);
+
                 if let Some(pos) = hover_pos {
-                    if !game.runner.moved {
-                        if is_within_power(game.runner.position, pos, game.power)
-                            && !game.blocker.blocked_squares.contains(&pos) {
-                            draw_rectangle(
-                                offset_x + pos.0 as f32 * sq_size,
-                                offset_y + pos.1 as f32 * sq_size,
-                                sq_size,
-                                sq_size,
+                    if game.current_player == player_type {
+                        let (color, valid_move) = match player_type.as_str() {
+                            "runner" => (
                                 Color::new(0.0, 1.0, 0.0, 0.3),
-                            );
-                        }
-                    } else if !game.blocker.moved {
-                        if pos != game.runner.position && !game.blocker.blocked_squares.contains(&pos) {
+                                is_within_power(game.runner.position, pos, game.power)
+                                    && !game.blocker.blocked_squares.contains(&pos)
+                            ),
+                            "blocker" => (
+                                Color::new(1.0, 0.0, 0.0, 0.3),
+                                pos != game.runner.position
+                                    && !game.blocker.blocked_squares.contains(&pos)
+                            ),
+                            _ => (Color::new(0.0, 0.0, 0.0, 0.0), false),
+                        };
+
+                        if valid_move {
                             draw_rectangle(
                                 offset_x + pos.0 as f32 * sq_size,
                                 offset_y + pos.1 as f32 * sq_size,
                                 sq_size,
                                 sq_size,
-                                Color::new(1.0, 0.0, 0.0, 0.3),
+                                color,
                             );
                         }
                     }
                 }
 
-                draw_text(format!("TURN: {}", game.turn_count).as_str(), 10., 45., 20., DARKGRAY);
+                if is_mouse_button_pressed(MouseButton::Left) && game.current_player == player_type {
+                    if let Some(grid_pos) = hover_pos {
+                        let action = match player_type.as_str() {
+                            "runner" if is_within_power(game.runner.position, grid_pos, game.power)
+                                && !game.blocker.blocked_squares.contains(&grid_pos) => {
+                                Some(format!("move_runner {} {}", grid_pos.0, grid_pos.1))
+                            }
+                            "blocker" if grid_pos != game.runner.position
+                                && !game.blocker.blocked_squares.contains(&grid_pos) => {
+                                Some(format!("move_blocker {} {}", grid_pos.0, grid_pos.1))
+                            }
+                            _ => None,
+                        };
 
-                let turn_text = if !game.runner.moved {
-                    "Runner's Turn"
-                } else if !game.blocker.moved {
-                    "Blocker's Turn"
-                } else {
-                    "Processing..."
-                };
-                draw_text(turn_text, 10., 70., 20., DARKGRAY);
-
-                if game.game_over {
-                    game = send_action("game_over", 0, 0);
-                } else if game.won {
-                    game = send_action("game_won", 0, 0);
+                        if let Some(action) = action {
+                            let (new_game, new_player_type, _) = match client.send_action(&action){
+                                Ok(response) => response,
+                                Err(e) => {
+                                    println!("Failed to send action: {}", e);
+                                    break;
+                                }
+                            };
+                            game = new_game;
+                            player_type = new_player_type;
+                        }
+                    }
                 }
-            }
-            GameState::GameOver(player_won) => {
-                clear_background(LIGHTGRAY);
-                let text = if player_won {
-                    "Runner won! Return to Menu"
-                } else {
-                    "Blocker won! Return to Menu"
-                };
-                let font_size = 30.;
-                let text_size = measure_text(text, None, font_size as _, 1.0);
-                let button_pos = Vec2::new(screen_width() / 2. - text_size.width / 2., screen_height() / 2. - text_size.height / 2.);
-                let button_size = Vec2::new(text_size.width, text_size.height);
 
                 draw_text(
-                    text,
-                    button_pos.x,
-                    button_pos.y + text_size.height,
-                    font_size,
-                    if player_won { SKYBLUE } else { DARKGRAY },
+                    &format!("Turn: {} | You are: {}", game.turn_count, player_type),
+                    10.,
+                    30.,
+                    20.,
+                    DARKGRAY,
                 );
-
-                if is_mouse_button_pressed(MouseButton::Left) {
-                    let mouse_pos = mouse_position();
-                    if is_mouse_over_button(Vec2::new(mouse_pos.0, mouse_pos.1), button_pos, button_size) {
-                        game = send_action("return_to_menu", 0, 0);
-                    }
-                }
+                draw_text(
+                    &format!("Current turn: {}", game.current_player),
+                    10.,
+                    60.,
+                    20.,
+                    if game.current_player == player_type { GREEN } else { DARKGRAY },
+                );
             }
+            GameState::GameOver(runner_won) => {
+                let text = if runner_won {
+                    if player_type == "runner" {
+                        "You won! The runner escaped!"
+                    } else {
+                        "You lost! The runner escaped!"
+                    }
+                } else {
+                    if player_type == "blocker" {
+                        "You won! The runner is trapped!"
+                    } else {
+                        "You lost! You are trapped!"
+                    }
+                };
+
+                let font_size = 30.;
+                let text_size = measure_text(text, None, font_size as _, 1.0);
+                draw_text(
+                    text,
+                    screen_width() / 2. - text_size.width / 2.,
+                    screen_height() / 2.,
+                    font_size,
+                    if runner_won == (player_type == "runner") { GREEN } else { RED },
+                );
+            }
+        }
+        if game.current_player != player_type && get_time() - last_update >= 0.1 {
+            let (new_game, new_player_type, _) = match client.send_action("poll") {
+                Ok(response) => response,
+                Err(e) => {
+                    println!("Failed to poll for updates: {}", e);
+                    break;
+                }
+            };
+            game = new_game;
+            player_type = new_player_type;
+            last_update = get_time();
         }
 
         next_frame().await;
